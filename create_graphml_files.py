@@ -13,6 +13,7 @@ from tqdm.auto import tqdm
 from datetime import datetime
 from functools import lru_cache
 
+# Enable progress bars for pandas operations
 tqdm.pandas()
 
 def compute_subtree_stats_dfs(G, node, memo):
@@ -24,39 +25,56 @@ def compute_subtree_stats_dfs(G, node, memo):
       - subgraph_size: number of descendants (not counting the node itself)
       - subgraph_merges: number of descendants with base_model_relation == "merge"
     The node's own values are not included; they can be added separately.
+    
+    Args:
+        G: NetworkX DiGraph representing the model relationships
+        node: The node (model) for which to compute descendant statistics
+        memo: Dictionary for memoization to prevent redundant computation
+        
+    Returns:
+        Dictionary with aggregated statistics for the node's descendants
     """
+    # Return memoized result if already computed for this node
     if node in memo:
         return memo[node]
 
+    # Initialize counters for aggregated statistics
     total_monthly = 0
     total_all_time = 0
     total_merges = 0
     total_size = 0
 
+    # Iterate through all children (successors) of the current node
     for child in G.successors(node):
-        # Get the child's own values
+        # Get the child's own monthly download count, defaulting to 0 if missing or invalid
         try:
             child_monthly = int(G.nodes[child].get("downloads", "0"))
         except Exception:
             child_monthly = 0
+            
+        # Get the child's own all-time download count, defaulting to 0 if missing or invalid
         try:
             child_all_time = int(G.nodes[child].get("downloadsAllTime", "0"))
         except Exception:
             child_all_time = 0
+            
+        # Check if the child is a merge of multiple models
         child_merge = 1 if G.nodes[child].get("base_model_relation", "unknown") == "merge" else 0
 
+        # Add the child's own statistics to the totals
         total_monthly += child_monthly
         total_all_time += child_all_time
         total_merges += child_merge
         total_size += 1  # count this child
 
-        # Recursively add the child's descendant stats
+        # Recursively compute and add the child's descendant stats
         child_stats = compute_subtree_stats_dfs(G, child, memo)
         total_monthly += child_stats["monthly_downloads"]
         total_all_time += child_stats["all_time_downloads"]
         total_merges += child_stats["subgraph_merges"]
         total_size += child_stats["subgraph_size"]
 
+    # Store the result in the memoization dictionary
     memo[node] = {
         "monthly_downloads": total_monthly,
         "all_time_downloads": total_all_time,
@@ -66,45 +84,76 @@ def compute_subtree_stats_dfs(G, node, memo):
     return memo[node]
 
 def main(args):
+    """
+    Main function to create GraphML files from processed model graphs.
+    
+    This function:
+    1. Loads the processed dataset and connected components
+    2. Computes statistics for each node and its descendants
+    3. Exports the graph data in both NetworkX pickle and GraphML formats
+    
+    Args:
+        args: Command-line arguments
+    """
+    # Define input paths for the processed dataset and connected components
     processed_dataset_path = os.path.join(args.processed_outputs_dir, f"{args.processed_hub_stats_fname}.csv")
     dataset = pd.read_csv(processed_dataset_path, low_memory=False)
     trees_save_path = os.path.join(args.processed_outputs_dir, f"{args.processed_hub_stats_fname}___cc_breakdown___root_type_{args.root_type}.pkl")
 
+    # Define output directories for GraphML and NetworkX pickle files
     exported_graphml_dir = os.path.join(args.output_cc_dir, f"{args.processed_hub_stats_fname}___cc_breakdown___root_type_{args.root_type}", "graphml")
     exported_networkx_dir = os.path.join(args.output_cc_dir, f"{args.processed_hub_stats_fname}___cc_breakdown___root_type_{args.root_type}", "networkx_pkl")
     os.makedirs(exported_graphml_dir, exist_ok=True)
     os.makedirs(exported_networkx_dir, exist_ok=True)
 
+    # Load the connected components (trees) from the pickle file
     with open(trees_save_path, 'rb') as f:
         trees = pickle.load(f)
 
+    # Filter the dataset for nodes that appear in the trees
+    # Note: These next lines are actually filtering different things
     filtered_dataset = dataset[dataset['id'].isin([node_id for tree in trees for node_id in tree.nodes()])]
+    # This filters for models that have no base model but aren't roots (possibly an error)
     filtered_dataset = dataset[dataset['base_model'].isna() & (dataset['base_model_relation'] != "root")]
     filtered_dataset = filtered_dataset.sort_values(by='downloads', ascending=False)
 
+    # Find the root node(s) for each tree (nodes with no incoming edges)
     graphs_and_roots = {tree_to_insp: [node for node in tree_to_insp.nodes if tree_to_insp.in_degree(node) == 0] for tree_to_insp in trees}
+    # Keep only graphs with at least 2 nodes
     graphs_and_roots = {k: v for k, v in graphs_and_roots.items() if len(k) > 1}
+    
+    # Create a new dictionary with sorted roots (by creation date)
     graphs_and_roots2 = {}
     for k, v in tqdm(sorted(graphs_and_roots.items(), key=lambda item: len(item[0]), reverse=True), desc="Sorting roots..."):
+        # Fix missing creation dates
         for node in v:
             val = k.nodes[node].get("createdAt", None)
             if val is None or (isinstance(val, float) and math.isnan(val)):
+                # If creation date is missing, set it to current date
                 k.nodes[node]["createdAt"] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        # Sort roots by creation date (oldest first)
         all_roots = sorted(v, key=lambda item: datetime.strptime(k.nodes[item].get("createdAt", datetime.now().strftime('%Y-%m-%d %H:%M:%S')), '%Y-%m-%d %H:%M:%S').timestamp())
         graphs_and_roots2[k] = all_roots
 
+    # Replace the original dictionary with the sorted version
     graphs_and_roots = graphs_and_roots2
+    # Create a reverse mapping from root nodes to their graphs
     roots_and_graphs = {v[0]: k for k, v in sorted(graphs_and_roots.items(), key=lambda item: len(item[0]), reverse=True)}
 
-    # Filter out trees with less than 1 nodes
+    # Filter out trees with only one node
     trees = [tree for tree in trees if len(tree.nodes) > 1]
+    # Sort trees by size (largest first)
     trees = sorted(trees, key=lambda x: len(x), reverse=True)
 
+    # Save each tree as a NetworkX pickle file
     for tree in tqdm(trees, desc="Saving networkx trees..."):
+        # Find the first root node of the tree
         first_root = [node for node in tree.nodes if tree.in_degree(node) == 0][0]
+        # Create a filename that includes the tree size and root node
         with open(os.path.join(exported_networkx_dir, f"n_nodes_{len(tree.nodes):05d}___root_{first_root.replace('/', '___')}.pkl"), 'wb') as f:
             pickle.dump({"cc": tree}, f)
 
+    # List of node attributes to remove for cleaner output
     node_atts_to_del = ['trendingScore',
                         'config',
                         'adapterhub',
@@ -127,34 +176,44 @@ def main(args):
                         "likes",
                         'doi']
 
+    # Clean tree nodes by removing unnecessary attributes
     for tree in tqdm(trees, desc="Cleaning tree nodes..."):
         for node_id, node_attr in tree.nodes(data=True):
             for node_att_to_del in node_atts_to_del:
                 if node_att_to_del in node_attr:
                     del tree.nodes[node_id][node_att_to_del]
 
+    # Standardize null/missing values in node attributes
     for tree in tqdm(trees, desc="Unifying tree Nones..."):
+        # Attributes that should be set to "unknown" if missing
         unknown_att = ['author', 'tags', "pipeline_tag", 'architectures', 'license', 'dataset']
+        # Attributes that should be set to -1 if missing
         minus1_att = ['downloads', "downloadsAllTime"]
 
         for node_id, node_attrs in tree.nodes(data=True):
             for node_attr in node_attrs:
                 node_attr_val = tree.nodes[node_id][node_attr]
+                # Check if value is None or NaN
                 if node_attr_val is None or (isinstance(node_attr_val, float) and math.isnan(node_attr_val)):
                     if node_attr in unknown_att:
+                        # Set to "unknown" for string attributes
                         node_attr_val = "unknown"
                     elif node_attr in minus1_att:
+                        # Set to -1 for download counts
                         node_attr_val = float(-1)
                     else:
+                        # Set to NaN for other attributes
                         node_attr_val = float('nan')
                 tree.nodes[node_id][node_attr] = node_attr_val
 
+    # Add columns for subgraph statistics to the dataset
     filtered_dataset.loc[:, 'subgraph_size'] = None
     filtered_dataset.loc[:, 'subgraph_merges'] = None
     filtered_dataset.loc[:, 'self_subgraph_monthly_downloads'] = None
     filtered_dataset.loc[:, 'self_subgraph_all_time_downloads'] = None
     filtered_dataset.loc[:, 'modality'] = None
 
+    # Dictionary mapping root models to their modality (manually defined)
     modalies = {'meta-llama/Meta-Llama-3-8B': "NLP",
                 'black-forest-labs/FLUX.1-dev': "vision",
                 'mistralai/Mistral-7B-v0.1': "NLP",
@@ -194,13 +253,18 @@ def main(args):
                 'timm/mobilenetv3_small_100.lamb_in1k': "vision"
                 }
 
+    # Calculate download and size statistics for each tree and its nodes
     for tree in tqdm(trees, desc="Calculating subtree download and size, trees..."):
         # Find the tree root (node with in_degree == 0)
         tree_root = [node for node in tree.nodes if tree.in_degree(node) == 0][0]
+        # Initialize memoization dict for efficient computation
         memo = {}
+        # Compute descendant statistics for the tree root
         compute_subtree_stats_dfs(tree, tree_root, memo)
 
+        # Update node attributes and dataset with the computed statistics
         for node_id, node_attrs in tqdm(tree.nodes(data=True), desc="Calculating subtree download and size, nodes..."):
+            # Get the node's own download counts
             try:
                 node_monthly = int(tree.nodes[node_id].get("downloads", "0"))
             except Exception:
@@ -210,15 +274,19 @@ def main(args):
             except Exception:
                 node_all_time = 0
 
+            # Get the statistics for the node's descendants
             descendant_stats = memo.get(node_id, {"monthly_downloads": 0, "all_time_downloads": 0, "subgraph_size": 0, "subgraph_merges": 0})
 
+            # Update node attributes with the combined statistics (node + descendants)
             tree.nodes[node_id]["self_subgraph_monthly_downloads"] = float(node_monthly + descendant_stats["monthly_downloads"])
             tree.nodes[node_id]["self_subgraph_all_time_downloads"] = float(node_all_time + descendant_stats["all_time_downloads"])
             tree.nodes[node_id]["subgraph_size"] = float(descendant_stats["subgraph_size"])
             tree.nodes[node_id]["subgraph_merges"] = float(descendant_stats["subgraph_merges"])
+            # Assign modality based on the tree root if it's in the modalities dictionary
             if tree_root in modalies:
                 tree.nodes[node_id]["modality"] = modalies[tree_root]
 
+            # Also update these values in the filtered dataset
             filtered_dataset.loc[filtered_dataset['id'] == node_id, 'self_subgraph_monthly_downloads'] = float(node_monthly + descendant_stats["monthly_downloads"])
             filtered_dataset.loc[filtered_dataset['id'] == node_id, 'self_subgraph_all_time_downloads'] = float(node_all_time + descendant_stats["all_time_downloads"])
             filtered_dataset.loc[filtered_dataset['id'] == node_id, 'subgraph_size'] = float(descendant_stats["subgraph_size"])
@@ -226,23 +294,36 @@ def main(args):
             if tree_root in modalies:
                 filtered_dataset.loc[filtered_dataset['id'] == node_id, 'modality'] = modalies[tree_root]
 
+        # Write the tree to a GraphML file
         nx.write_graphml(tree, os.path.join(exported_graphml_dir, f"n_nodes_{len(tree.nodes):05d}__root_{tree_root.replace('/', '___')}.graphml"))
 
+    # Save the filtered dataset to CSV
     filtered_dataset.to_csv(os.path.join(exported_graphml_dir, "filtered_dataset.csv"), index=False)
 
 
 def default_argument_parser():
+    """
+    Create an argument parser with default values for creating GraphML files.
+    
+    Returns:
+        An argparse.ArgumentParser object with predefined arguments
+    """
     parser = argparse.ArgumentParser()
+    # Directory containing processed data
     parser.add_argument("--processed_outputs_dir", type=str, default="processed_hub_stats")
+    # Base filename for processed data
     parser.add_argument("--processed_hub_stats_fname", type=str, default="processed_hub_stats___manual_annot_v6___with_auto_model_card_extracted_parents")
+    # Directory to save output connected components
     parser.add_argument("--output_cc_dir", type=str, default="individual_ccs")
-
+    # Type of root node used in graph construction
     parser.add_argument("--root_type", type=str, default="root", choices=["root", "weak_cc"])
     return parser
 
 
 if __name__ == "__main__":
+    # Parse command line arguments
     args = default_argument_parser().parse_args()
+    # Create output directory if it doesn't exist
     os.makedirs(args.output_cc_dir, exist_ok=True)
-
+    # Run the main function
     main(args)
