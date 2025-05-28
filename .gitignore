@@ -1,0 +1,19 @@
+
+# ignore any __pycache__ directories or sub dirs containing __pycache__
+__pycache__/
+# ignore any .pyc files in __pycache__ directories
+__pycache__/**/*.pyc
+# ignore any .pyc files in the root directory
+*.pyc
+# ignore any .pyc files in subdirectories
+**/__pycache__/*.pyc
+
+# ignore any environment directories
+atlas_env/
+
+# ignore ouput directories
+individual_ccs/
+
+
+# ignore process hub stats
+processed_hub_stats/processed_hub_stats_*

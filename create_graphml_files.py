@@ -108,13 +108,16 @@ def main(args):
 
     # Load the connected components (trees) from the pickle file
     with open(trees_save_path, 'rb') as f:
-        trees = pickle.load(f)
-
-    # Filter the dataset for nodes that appear in the trees
-    # Note: These next lines are actually filtering different things
-    filtered_dataset = dataset[dataset['id'].isin([node_id for tree in trees for node_id in tree.nodes()])]
-    # This filters for models that have no base model but aren't roots (possibly an error)
-    filtered_dataset = dataset[dataset['base_model'].isna() & (dataset['base_model_relation'] != "root")]
+        trees = pickle.load(f)    # Filter the dataset for nodes that appear in the trees
+    node_ids = [node_id for tree in trees for node_id in tree.nodes()]
+    filtered_dataset = dataset[dataset['id'].isin(node_ids)]
+    
+    # Also identify models that have no base model but aren't roots (possibly an error)
+    # But don't overwrite our main filtered dataset
+    error_models = dataset[dataset['base_model'].isna() & (dataset['base_model_relation'] != "root")]
+    if not error_models.empty:
+        print(f"Found {len(error_models)} models with no base model but not marked as root")
+    
     filtered_dataset = filtered_dataset.sort_values(by='downloads', ascending=False)
 
     # Find the root node(s) for each tree (nodes with no incoming edges)
@@ -143,15 +146,41 @@ def main(args):
     # Filter out trees with only one node
     trees = [tree for tree in trees if len(tree.nodes) > 1]
     # Sort trees by size (largest first)
-    trees = sorted(trees, key=lambda x: len(x), reverse=True)
-
-    # Save each tree as a NetworkX pickle file
+    trees = sorted(trees, key=lambda x: len(x), reverse=True)    # Save each tree as a NetworkX pickle file
     for tree in tqdm(trees, desc="Saving networkx trees..."):
-        # Find the first root node of the tree
-        first_root = [node for node in tree.nodes if tree.in_degree(node) == 0][0]
-        # Create a filename that includes the tree size and root node
-        with open(os.path.join(exported_networkx_dir, f"n_nodes_{len(tree.nodes):05d}___root_{first_root.replace('/', '___')}.pkl"), 'wb') as f:
-            pickle.dump({"cc": tree}, f)
+        try:
+            # Find root nodes of the tree (nodes with no incoming edges)
+            root_nodes = [node for node in tree.nodes if tree.in_degree(node) == 0]
+            
+            # Skip trees with no root nodes - these might have had edges removed due to errors
+            if not root_nodes:
+                print(f"Warning: Tree with {len(tree.nodes)} nodes has no root nodes. Skipping.")
+                continue
+                
+            # Use the first root node for the filename
+            first_root = root_nodes[0]
+            
+            # Ensure the networkx_pkl directory exists
+            os.makedirs(exported_networkx_dir, exist_ok=True)
+            
+            # Create a safe filename without characters that could cause path issues
+            safe_root_name = first_root.replace('/', '___')
+            safe_root_name = re.sub(r'[^\w\s.-]', '_', safe_root_name)  # Replace any non-alphanumeric/underscore with _
+            
+            # Keep the filename under a reasonable length to avoid path length issues
+            if len(safe_root_name) > 100:
+                safe_root_name = safe_root_name[:100]
+                
+            filename = f"n_nodes_{len(tree.nodes):05d}___root_{safe_root_name}.pkl"
+            filepath = os.path.join(exported_networkx_dir, filename)
+            
+            # Save the pickle file
+            with open(filepath, 'wb') as f:
+                pickle.dump({"cc": tree}, f)
+        except Exception as e:
+            print(f"Error saving tree: {e}")
+            # Continue processing other trees
+            continue
 
     # List of node attributes to remove for cleaner output
     node_atts_to_del = ['trendingScore',
@@ -251,16 +280,28 @@ def main(args):
                 'openai/clip-vit-large-patch14': "vision",
                 'openai/clip-vit-base-patch32': "vision",
                 'timm/mobilenetv3_small_100.lamb_in1k': "vision"
-                }
-
-    # Calculate download and size statistics for each tree and its nodes
+                }    # Calculate download and size statistics for each tree and its nodes
     for tree in tqdm(trees, desc="Calculating subtree download and size, trees..."):
-        # Find the tree root (node with in_degree == 0)
-        tree_root = [node for node in tree.nodes if tree.in_degree(node) == 0][0]
+        # Find all root nodes (nodes with in_degree == 0)
+        root_nodes = [node for node in tree.nodes if tree.in_degree(node) == 0]
+        
+        # Skip trees with no root nodes
+        if not root_nodes:
+            print(f"Warning: Tree with {len(tree.nodes)} nodes has no root nodes during statistics calculation. Skipping.")
+            continue
+            
+        # Use the first root node for calculations
+        tree_root = root_nodes[0]
+        
         # Initialize memoization dict for efficient computation
         memo = {}
+        
         # Compute descendant statistics for the tree root
-        compute_subtree_stats_dfs(tree, tree_root, memo)
+        try:
+            compute_subtree_stats_dfs(tree, tree_root, memo)
+        except Exception as e:
+            print(f"Error computing statistics for tree with root {tree_root}: {e}")
+            continue
 
         # Update node attributes and dataset with the computed statistics
         for node_id, node_attrs in tqdm(tree.nodes(data=True), desc="Calculating subtree download and size, nodes..."):
@@ -284,18 +325,31 @@ def main(args):
             tree.nodes[node_id]["subgraph_merges"] = float(descendant_stats["subgraph_merges"])
             # Assign modality based on the tree root if it's in the modalities dictionary
             if tree_root in modalies:
-                tree.nodes[node_id]["modality"] = modalies[tree_root]
-
-            # Also update these values in the filtered dataset
-            filtered_dataset.loc[filtered_dataset['id'] == node_id, 'self_subgraph_monthly_downloads'] = float(node_monthly + descendant_stats["monthly_downloads"])
-            filtered_dataset.loc[filtered_dataset['id'] == node_id, 'self_subgraph_all_time_downloads'] = float(node_all_time + descendant_stats["all_time_downloads"])
-            filtered_dataset.loc[filtered_dataset['id'] == node_id, 'subgraph_size'] = float(descendant_stats["subgraph_size"])
-            filtered_dataset.loc[filtered_dataset['id'] == node_id, 'subgraph_merges'] = float(descendant_stats["subgraph_merges"])
-            if tree_root in modalies:
-                filtered_dataset.loc[filtered_dataset['id'] == node_id, 'modality'] = modalies[tree_root]
-
-        # Write the tree to a GraphML file
-        nx.write_graphml(tree, os.path.join(exported_graphml_dir, f"n_nodes_{len(tree.nodes):05d}__root_{tree_root.replace('/', '___')}.graphml"))
+                tree.nodes[node_id]["modality"] = modalies[tree_root]            # Also update these values in the filtered dataset, but only if the node exists in the dataset
+            if node_id in filtered_dataset['id'].values:
+                try:
+                    filtered_dataset.loc[filtered_dataset['id'] == node_id, 'self_subgraph_monthly_downloads'] = float(node_monthly + descendant_stats["monthly_downloads"])
+                    filtered_dataset.loc[filtered_dataset['id'] == node_id, 'self_subgraph_all_time_downloads'] = float(node_all_time + descendant_stats["all_time_downloads"])
+                    filtered_dataset.loc[filtered_dataset['id'] == node_id, 'subgraph_size'] = float(descendant_stats["subgraph_size"])
+                    filtered_dataset.loc[filtered_dataset['id'] == node_id, 'subgraph_merges'] = float(descendant_stats["subgraph_merges"])
+                    if tree_root in modalies:
+                        filtered_dataset.loc[filtered_dataset['id'] == node_id, 'modality'] = modalies[tree_root]
+                except Exception as e:
+                    print(f"Error updating dataset for node {node_id}: {e}")
+                    continue# Write the tree to a GraphML file
+        try:
+            # Create a safe filename
+            safe_root_name = tree_root.replace('/', '___')
+            safe_root_name = re.sub(r'[^\w\s.-]', '_', safe_root_name)  # Replace any non-alphanumeric/underscore with _
+            
+            # Keep the filename under a reasonable length
+            if len(safe_root_name) > 100:
+                safe_root_name = safe_root_name[:100]
+                
+            graphml_path = os.path.join(exported_graphml_dir, f"n_nodes_{len(tree.nodes):05d}__root_{safe_root_name}.graphml")
+            nx.write_graphml(tree, graphml_path)
+        except Exception as e:
+            print(f"Error writing GraphML for tree with root {tree_root}: {e}")
 
     # Save the filtered dataset to CSV
     filtered_dataset.to_csv(os.path.join(exported_graphml_dir, "filtered_dataset.csv"), index=False)

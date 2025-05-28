@@ -44,16 +44,65 @@ def get_ccs_from_digraph_based_on_roots(G):
 
 
 def remove_self_loops_and_cycles(model_graph):
+    """Removes self-loops and cycles from the graph."""
     print("Removing self-loops and cycles...")
-
     self_loops = list(nx.selfloop_edges(model_graph))
-    print(f"Found {len(self_loops)} self-loops, removing them...")
-    model_graph.remove_edges_from(self_loops)
+    if self_loops:
+        print(f"Found {len(self_loops)} self-loops, removing them...")
+        model_graph.remove_edges_from(self_loops)
 
-    cycles = list(nx.simple_cycles(model_graph))
-    # TODO: Importamt, how do we remove the cycles? I think that removing the first edge may not be enough, e.g., if it is a merge of 3 models, a root and 2 others that are cildren of the root. We need to remove the root, not the others
-    print(f"Found {len(cycles)} cycles, removing them...")
-    for cycle in cycles:
-        # TODO: Find the latest node and remove and edge from it
-        model_graph.remove_edge(cycle[0], cycle[1])
+    # Remove cycles
+    cycles_removed_count = 0
+    while True:
+        try:
+            cycle = nx.find_cycle(model_graph, orientation="original")
+            if not cycle:
+                break
+            print(f"Found cycle with {len(cycle)} edges: {cycle}")
+            
+            # cycle is a list of edges, each edge is (u, v) for simple graphs
+            # Let's try to remove the first edge in the cycle
+            first_edge = cycle[0]
+            
+            # Handle different possible formats
+            if len(first_edge) >= 2:
+                u, v = first_edge[0], first_edge[1]
+                print(f"Attempting to remove edge: {u} -> {v}")
+                
+                # Check if the edge actually exists before trying to remove it
+                if model_graph.has_edge(u, v):
+                    try:
+                        model_graph.remove_edge(u, v)
+                        print(f"Successfully removed edge: {u} -> {v}")
+                        cycles_removed_count += 1
+                    except nx.NetworkXError as e:
+                        print(f"Error removing edge ({u}, {v}): {e}")
+                        print(f"Edge exists check: {model_graph.has_edge(u, v)}")
+                        print(f"Node {u} exists: {u in model_graph.nodes}")
+                        print(f"Node {v} exists: {v in model_graph.nodes}")
+                        break
+                else:
+                    print(f"Edge ({u}, {v}) does not exist in graph!")
+                    print(f"Available edges from {u}: {list(model_graph.successors(u)) if u in model_graph.nodes else 'Node not found'}")
+                    print(f"Available edges to {v}: {list(model_graph.predecessors(v)) if v in model_graph.nodes else 'Node not found'}")
+                    break
+            else:
+                print(f"Unexpected edge format: {first_edge}")
+                break
+                
+        except nx.NetworkXNoCycle:
+            print("No more cycles found.")
+            break
+        except Exception as e:
+            print(f"An unexpected error occurred during cycle detection/removal: {e}")
+            if 'cycle' in locals() and cycle:
+                print(f"Problematic cycle data: {cycle}")
+            break
+
+    if cycles_removed_count > 0:
+        print(f"Removed {cycles_removed_count} cycles.")
+    else:
+        print("No cycles were removed (or an error occurred).")
+
+    print(f"Graph after removing self-loops and cycles has {model_graph.number_of_nodes()} nodes and {model_graph.number_of_edges()} edges.")
     return model_graph
